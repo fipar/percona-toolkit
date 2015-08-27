@@ -3,7 +3,8 @@ Percona Toolkit
 
 Percona Toolkit is a collection of advanced command-line tools used by
 Percona (http://www.percona.com/) support staff to perform a variety of
-MySQL and system tasks that are too difficult or complex to perform manually.
+MySQL, MongoDB and system tasks that are too difficult or complex to 
+perform manually.
 
 These tools are ideal alternatives to private or "one-off" scripts because
 they are professionally developed, formally tested, and fully documented.
@@ -12,7 +13,10 @@ no libraries are installed.
 
 Percona Toolkit is developed and supported by Percona Inc.  For more
 information and other free, open-source software developed by Percona,
-visit http://www.percona.com/software/.
+visit http://www.percona.com/software/. Additionally, at any point in
+time, this repository may include changes made by Fernando Ipar (like 
+MongoDB support for pt-stalk) that have not yet been (and may never be)
+merged with upstream. 
 
 Installing
 ----------
