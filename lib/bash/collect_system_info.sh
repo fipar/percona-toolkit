@@ -542,11 +542,11 @@ top_processes () { local PTFUNCNAME=top_processes;
    if [ "$CMD_PRSTAT" ]; then
       $CMD_PRSTAT | head
    elif [ "$CMD_TOP" ]; then
-      local cmd="$CMD_TOP -bn 1"
+      local cmd="$CMD_TOP -bn $OPT_RUN_TIME"
       if    [ "${platform}" = "FreeBSD" ] \
          || [ "${platform}" = "NetBSD"  ] \
          || [ "${platform}" = "OpenBSD" ]; then
-         cmd="$CMD_TOP -b -d 1"
+         cmd="$CMD_TOP -b -d $OPT_RUN_TIME"
       fi
       $cmd \
          | sed -e 's# *$##g' -e '/./{H;$!d;}' -e 'x;/PID/!d;' \

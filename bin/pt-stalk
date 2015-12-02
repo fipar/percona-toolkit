@@ -541,7 +541,14 @@ mysql_options() {
    if [ -n "$OPT_USER" ]; then
       MYSQL_ARGS="$MYSQL_ARGS --user=$OPT_USER"
    fi
-   if [ -n "$OPT_PASSWORD" ]; then
+   if [ -n "$OPT_ASK_PASS" ]; then
+      stty -echo
+      >&2 printf "Enter MySQL password: "
+      read GIVEN_PASS 
+      stty echo
+      printf "\n"
+      MYSQL_ARGS="$MYSQL_ARGS --password=$GIVEN_PASS"
+   elif [ -n "$OPT_PASSWORD" ]; then
       MYSQL_ARGS="$MYSQL_ARGS --password=$OPT_PASSWORD"
    fi
    
@@ -877,7 +884,7 @@ collect() {
    fi
 
    ps -eaf  >> "$d/$p-ps"  &
-   top -bn1 >> "$d/$p-top" &
+   top -bn $OPT_RUN_TIME >> "$d/$p-top" &
 
    [ "$mysqld_pid" ] && _lsof $mysqld_pid >> "$d/$p-lsof" &
 
