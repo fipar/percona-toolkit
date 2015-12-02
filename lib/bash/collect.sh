@@ -155,6 +155,7 @@ collect() {
    # them all up as quickly as possible.  
    ps -eaf  >> "$d/$p-ps"  &
    top -bn $OPT_RUN_TIME >> "$d/$p-top" &
+   which iotop && iotop -bn $OPT_RUN_TIME >> "$d/$p-iotop" &
 
    [ "$mysqld_pid" ] && _lsof $mysqld_pid >> "$d/$p-lsof" &
 
