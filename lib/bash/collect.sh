@@ -156,6 +156,9 @@ collect() {
    ps -eaf  >> "$d/$p-ps"  &
    top -bn $OPT_RUN_TIME >> "$d/$p-top" &
    which iotop && iotop -bn $OPT_RUN_TIME >> "$d/$p-iotop" &
+   uptime >> "$d/$p-uptime" & 
+   which pidstat && pidstat 1 $OPT_RUN_TIME >> "$d/$p-pidstat" &
+   which sar && sar -A 1 $OPT_RUN_TIME >> "$d/$p-sar" &
 
    [ "$mysqld_pid" ] && _lsof $mysqld_pid >> "$d/$p-lsof" &
 
@@ -163,11 +166,9 @@ collect() {
       $CMD_SYSCTL -a >> "$d/$p-sysctl" &
    fi
 
-   # collect dmesg events from 60 seconds ago until present
+   # collect last dmesg events 
    if [ "$CMD_DMESG" ]; then
-      local UPTIME=`cat /proc/uptime | awk '{ print $1 }'`
-      local START_TIME=$(echo "$UPTIME 60" | awk '{print ($1 - $2)}')
-      $CMD_DMESG  | perl -ne 'm/\[\s*(\d+)\./; if ($1 > '${START_TIME}') { print }' >> "$d/$p-dmesg" & 
+      $CMD_DMESG | tail  >> "$d/$p-dmesg" & 
    fi
 
    local cnt=$(($OPT_RUN_TIME / $OPT_SLEEP_COLLECT))
