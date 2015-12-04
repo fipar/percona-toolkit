@@ -6298,7 +6298,7 @@ sub new {
 
 sub next {
    my ($self) = @_;
-
+   sleep 1;
    if ( !$self->{oktonibble} ) {
       PTDEBUG && _d('Not ok to nibble');
       return;
