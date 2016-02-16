@@ -127,6 +127,58 @@ collect() {
     open_tables                      >> "$d/$p-opentables1"   &
    fi
 
+   # Getting a GDB stacktrace can be an intensive operation,
+   # so do this only if necessary (and possible).
+   if [ "$CMD_GDB" -a "$OPT_COLLECT_GDB" -a "$mysqld_pid" ]; then
+      $CMD_GDB                     \
+         -ex "set pagination 0"    \
+         -ex "thread apply all bt" \
+         --batch -p $mysqld_pid    \
+         >> "$d/$p-stacktrace"
+   fi
+
+   # Get MySQL's variables if possible.  Then sleep long enough that we probably
+   # complete SHOW VARIABLES if all's well.  (We don't want to run mysql in the
+   # foreground, because it could hang.)
+   $CMD_MYSQL $EXT_ARGV -e 'SHOW GLOBAL VARIABLES' >> "$d/$p-variables" &
+   sleep .2
+
+   # Get the major.minor version number.  Version 3.23 doesn't matter for our
+   # purposes, and other releases have x.x.x* version conventions so far.
+   local mysql_version="$(awk '/^version[^_]/{print substr($2,1,3)}' "$d/$p-variables")"
+
+   # Is MySQL logging its errors to a file?  If so, tail that file.
+   local mysql_error_log="$(awk '/^log_error/{print $2}' "$d/$p-variables")"
+   if [ -z "$mysql_error_log" -a "$mysqld_pid" ]; then
+      # Try getting it from the open filehandle...
+      mysql_error_log="$(ls -l /proc/$mysqld_pid/fd | awk '/ 2 ->/{print $NF}')"
+   fi
+
+   local tail_error_log_pid=""
+   if [ "$mysql_error_log" ]; then
+      log "The MySQL error log seems to be $mysql_error_log"
+      tail -f "$mysql_error_log" >"$d/$p-log_error" &
+      tail_error_log_pid=$!
+
+      # Send a mysqladmin debug to the server so we can potentially learn about
+      # locking etc.
+      $CMD_MYSQLADMIN $EXT_ARGV debug
+   else
+      log "Could not find the MySQL error log"
+   fi
+
+   # Get a sample of these right away, so we can get these without interaction
+   # with the other commands we're about to run.
+   if [ "${mysql_version}" '>' "5.1" ]; then
+      local mutex="SHOW ENGINE INNODB MUTEX"
+   else
+      local mutex="SHOW MUTEX STATUS"
+   fi
+   innodb_status 1
+   tokudb_status 1
+   $CMD_MYSQL $EXT_ARGV -e "$mutex" >> "$d/$p-mutex-status1" &
+   open_tables                      >> "$d/$p-opentables1"   &
+
    # If TCP dumping is specified, start that on the server's port.
    local tcpdump_pid=""
    if [ "$CMD_TCPDUMP" -a  "$OPT_COLLECT_TCPDUMP" ]; then
@@ -147,7 +199,7 @@ collect() {
       fi
    elif [ "$CMD_STRACE" -a "$OPT_COLLECT_STRACE" -a "$mysqld_pid" ]; then
       # Don't run oprofile and strace at the same time.
-      $CMD_STRACE -T -s 0 -f -p $mysqld_pid > "${DEST}/$d-strace" &
+      $CMD_STRACE -T -s 0 -f -p $mysqld_pid -o "$d/$p-strace" &
       local strace_pid=$!
    fi
 
@@ -305,6 +357,7 @@ collect() {
    
    if [ "$OPT_MONGO" != "yes" ]; then
     innodb_status 2
+    tokudb_status 2
     $CMD_MYSQL $EXT_ARGV -e "$mutex" >> "$d/$p-mutex-status2" &
     open_tables                      >> "$d/$p-opentables2"   &
 
@@ -329,7 +382,7 @@ collect() {
    for file in "$d/$p-"*; do
       # If there's not at least 1 line that's not a TS,
       # then the file is empty.
-      if [ -z "$(grep -v '^TS ' --max-count 1 "$file")" ]; then
+      if [ -z "$(grep -v '^TS ' --max-count 10 "$file")" ]; then
          log "Removing empty file $file";
          rm "$file"
       fi
@@ -346,7 +399,7 @@ open_tables() {
 }
 
 lock_waits() {
-   local sql1="SELECT
+   local sql1="SELECT SQL_NO_CACHE
       CONCAT('thread ', b.trx_mysql_thread_id, ' from ', p.host) AS who_blocks,
       IF(p.command = \"Sleep\", p.time, 0) AS idle_in_trx,
       MAX(TIMESTAMPDIFF(SECOND, r.trx_wait_started, CURRENT_TIMESTAMP)) AS max_wait_time,
@@ -358,7 +411,7 @@ lock_waits() {
    GROUP BY who_blocks ORDER BY num_waiters DESC\G"
    $CMD_MYSQL $EXT_ARGV -e "$sql1"
 
-   local sql2="SELECT
+   local sql2="SELECT SQL_NO_CACHE
       r.trx_id AS waiting_trx_id,
       r.trx_mysql_thread_id AS waiting_thread,
       TIMESTAMPDIFF(SECOND, r.trx_wait_started, CURRENT_TIMESTAMP) AS wait_time,
@@ -379,9 +432,16 @@ lock_waits() {
 } 
 
 transactions() {
-   $CMD_MYSQL $EXT_ARGV -e "SELECT * FROM INFORMATION_SCHEMA.INNODB_TRX\G"
-   $CMD_MYSQL $EXT_ARGV -e "SELECT * FROM INFORMATION_SCHEMA.INNODB_LOCKS\G"
-   $CMD_MYSQL $EXT_ARGV -e "SELECT * FROM INFORMATION_SCHEMA.INNODB_LOCK_WAITS\G"
+   $CMD_MYSQL $EXT_ARGV -e "SELECT SQL_NO_CACHE * FROM INFORMATION_SCHEMA.INNODB_TRX\G"
+   $CMD_MYSQL $EXT_ARGV -e "SELECT SQL_NO_CACHE * FROM INFORMATION_SCHEMA.INNODB_LOCKS\G"
+   $CMD_MYSQL $EXT_ARGV -e "SELECT SQL_NO_CACHE * FROM INFORMATION_SCHEMA.INNODB_LOCK_WAITS\G"
+}
+
+tokudb_status() {
+    local n=$1
+
+    $CMD_MYSQL $EXT_ARGV -e "SHOW ENGINE TOKUDB STATUS\G" \
+      >> "$d/$p-tokudbstatus$n" || rm -f "$d/$p-tokudbstatus$n"
 }
 
 innodb_status() {

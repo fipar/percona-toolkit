@@ -2303,13 +2303,6 @@ sub get_dbh {
    if ( $cxn_string =~ m/mysql/i ) {
       my $sql;
 
-      $sql = 'SELECT @@SQL_MODE';
-      PTDEBUG && _d($dbh, $sql);
-      my ($sql_mode) = eval { $dbh->selectrow_array($sql) };
-      if ( $EVAL_ERROR ) {
-         die "Error getting the current SQL_MODE: $EVAL_ERROR";
-      }
-
       if ( my ($charset) = $cxn_string =~ m/charset=([\w]+)/ ) {
          $sql = qq{/*!40101 SET NAMES "$charset"*/};
          PTDEBUG && _d($dbh, $sql);
@@ -2329,6 +2322,13 @@ sub get_dbh {
 
       if ( my $vars = $self->prop('set-vars') ) {
          $self->set_vars($dbh, $vars);
+      }
+
+      $sql = 'SELECT @@SQL_MODE';
+      PTDEBUG && _d($dbh, $sql);
+      my ($sql_mode) = eval { $dbh->selectrow_array($sql) };
+      if ( $EVAL_ERROR ) {
+         die "Error getting the current SQL_MODE: $EVAL_ERROR";
       }
 
       $sql = 'SET @@SQL_QUOTE_SHOW_CREATE = 1'
@@ -3591,11 +3591,10 @@ sub new {
       last_reported => $args{start},
       fraction      => 0,       # How complete the job is
       callback      => sub {
-         my ($fraction, $elapsed, $remaining, $eta) = @_;
+         my ($fraction, $elapsed, $remaining) = @_;
          printf STDERR "$name: %3d%% %s remain\n",
             $fraction * 100,
-            Transformers::secs_to_time($remaining),
-            Transformers::ts($eta);
+            Transformers::secs_to_time($remaining);
       },
       %args,
    };
@@ -4057,28 +4056,22 @@ use warnings FATAL => 'all';
 use English qw(-no_match_vars);
 use constant PTDEBUG => $ENV{PTDEBUG} || 0;
 
-sub check_recursion_method {
+sub check_recursion_method {                                                       
    my ($methods) = @_;
-
-   foreach my $method ( @$methods ) {
-      die "Invalid recursion method: " . ($method || 'undef') . "\n"
-         unless $method && $method =~ m/^(?:processlist$|hosts$|none$|cluster|dsn=)/i;
-   }
-
-   if ( @$methods > 1 ) {
-      if ( grep( { m/none/ } @$methods) && grep( {! m/none/ } @$methods) ) {
-            die "--recursion-method=none cannot be combined with other methods\n";
-      }
-      elsif ( grep({ !m/processlist|hosts/i } @$methods)
-            && $methods->[0] !~ /^dsn=/i )
-      {
-         die  "Invalid combination of recursion methods: "
-            . join(", ", map { defined($_) ? $_ : 'undef' } @$methods) . ". "
-            . "Only hosts and processlist may be combined.\n"
-      }
-   }
-
-   return;
+   if ( @$methods != 1 ) {                                                         
+      if ( grep({ !m/processlist|hosts/i } @$methods)                              
+            && $methods->[0] !~ /^dsn=/i ) 
+      {     
+         die  "Invalid combination of recursion methods: "                         
+            . join(", ", map { defined($_) ? $_ : 'undef' } @$methods) . ". "      
+            . "Only hosts and processlist may be combined.\n"                      
+      }                                                                            
+   }     
+   else {   
+      my ($method) = @$methods;
+      die "Invalid recursion method: " . ( $method || 'undef' )                    
+         unless $method && $method =~ m/^(?:processlist$|hosts$|none$|cluster$|dsn=)/i;     
+   }                                                                               
 }
 
 sub new {
@@ -6130,8 +6123,8 @@ sub shorten {
    }
    return sprintf(
       $num =~ m/\./ || $n
-         ? "%.${p}f%s"
-         : '%d',
+         ? '%1$.'.$p.'f%2$s'
+         : '%1$d',
       $num, $units[$n]);
 }
 
@@ -8029,14 +8022,24 @@ my $term_readkey = eval {
 use sigtrap 'handler', \&sig_int, 'normal-signals';
 
 
-
-
 my $exit_status = 0;
 my $oktorun     = 1;
 my $dont_interrupt_now = 0;
 my @drop_trigger_sqls;
 my @triggers_not_dropped;
 my $pxc_version = '0';
+# Completely ignore these error codes.
+my %ignore_code = (
+   # Error: 1592 SQLSTATE: HY000  (ER_BINLOG_UNSAFE_STATEMENT)
+   # Message: Statement may not be safe to log in statement format. 
+   # Ignore this warning because we have purposely set statement-based
+   # replication.
+   1592 => 1,
+   # Error: 1062 SQLSTATE: 23000 ( ER_DUP_ENTRY )
+   # Message: Duplicate entry '%ld' for key '%s'
+   # MariaDB 5.5.28+ has this as a warning; See https://bugs.launchpad.net/percona-toolkit/+bug/1099836
+   1062 => 1,
+);
 
 $OUTPUT_AUTOFLUSH = 1;
 
@@ -8049,6 +8052,7 @@ sub main {
    @drop_trigger_sqls    = ();
    @triggers_not_dropped = ();
    $dont_interrupt_now   = 0;
+   %ignore_code = (1592 => 1, 1062 => 1);
 
    my %stats = (
       INSERT => 0,
@@ -8061,6 +8065,10 @@ sub main {
    my $o = new OptionParser();
    $o->get_specs();
    $o->get_opts();
+
+   if ( $o->get('null-to-not-null') ) {
+      $ignore_code{1048} = 1;
+   } 
 
    my $dp = $o->DSNParser();
    $dp->prop('set-vars', $o->set_vars());
@@ -10749,18 +10757,6 @@ sub exec_nibble {
    my $chunk       = $nibble_iter->nibble_number();
    my $chunk_index = $nibble_iter->nibble_index();
          
-   # Completely ignore these error codes.
-   my %ignore_code = (
-      # Error: 1592 SQLSTATE: HY000  (ER_BINLOG_UNSAFE_STATEMENT)
-      # Message: Statement may not be safe to log in statement format. 
-      # Ignore this warning because we have purposely set statement-based
-      # replication.
-      1592 => 1,
-      # Error: 1062 SQLSTATE: 23000 ( ER_DUP_ENTRY )
-      # Message: Duplicate entry '%ld' for key '%s'
-      # MariaDB 5.5.28+ has this as a warning; See https://bugs.launchpad.net/percona-toolkit/+bug/1099836
-      1062 => 1,
-   );
          
    # Warn once per-table for these error codes if the error message
    # matches the pattern.
@@ -11614,6 +11610,13 @@ to 10 C<_> (underscore) to find a unique table name.  If a table name is
 specified, the tool does not prefix it with C<_>, so the table must not
 exist.
 
+=item --null-to-not-null
+
+Allows MODIFYing a column that allows NULL values to one that doesn't allow
+them. The rows which contain NULL values will be converted to the defined
+default value. If no explicit DEFAULT value is given MySQL will assign a default
+value based on datatype, e.g. 0 for number datatypes, '' for string datatypes.
+
 =item --password
 
 short form: -p; type: string
@@ -11736,6 +11739,15 @@ example, specifying C<--set-vars wait_timeout=500> overrides the default
 value of C<10000>.
 
 The tool prints a warning and continues if a variable cannot be set.
+
+Note that setting the C<sql_mode> variable requires some tricky escapes
+to be able to parse the quotes and commas.
+
+Example: 
+
+   --set-vars sql_mode=\'STRICT_ALL_TABLES\\,ALLOW_INVALID_DATES\'
+
+Note the single backslash for the quotes and double backslash for the comma.
 
 =item --sleep
 

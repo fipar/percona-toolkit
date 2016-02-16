@@ -14,7 +14,7 @@ use Test::More;
 use Data::Dumper;
 use PerconaTest;
 use Sandbox;
-
+use SqlModes;
 require "$trunk/bin/pt-online-schema-change";
 
 my $dp = new DSNParser(opts=>$dsn_opts);
@@ -37,6 +37,52 @@ my @args       = (qw(--set-vars innodb_lock_wait_timeout=3));
 my $output;
 my $exit_status;
 my $sample  = "t/pt-online-schema-change/samples/";
+
+
+# ############################################################################
+# https://bugs.launchpad.net/percona-toolkit/+bug/1336734
+# pt-online-schema-change 2.2.17 adds --null-to-not-null feature
+# ############################################################################
+$sb->load_file('master', "$sample/bug-1336734.sql");
+
+($output, $exit_status) = full_output(
+   sub { pt_online_schema_change::main(@args, 
+      "$master_dsn,D=test,t=lp1336734",
+      "--execute",
+      "--null-to-not-null",
+      # notice we are not using a DEFAULT value, to also
+      # test if the "default default" value for datatype
+      # is used         
+      "--alter", "MODIFY COLUMN name VARCHAR(20) NOT NULL",
+      qw(--chunk-size 2 --print)) },
+);
+
+my $test_rows = $master_dbh->selectall_arrayref("SELECT id, name FROM test.lp1336734 ORDER BY id");
+ok (!$exit_status,
+    "--null-to-not-null exit status = 0"
+);
+is_deeply(
+   $test_rows,
+  [
+     [
+       '1',
+       'curly'
+     ],
+     [
+       '2',
+       'larry'
+     ],
+     [
+       '3',
+       ''
+     ],
+     [
+       '4',
+       'moe'
+     ]
+  ],
+   "--null-to-not-null default value good"
+);
 
 # ############################################################################
 # https://bugs.launchpad.net/percona-toolkit/+bug/994002
@@ -464,6 +510,39 @@ like(
       qr/Error altering new table/s,
       "Bug 1446928: Avoid error trapping loop when --alter is invalid",
 );
+
+# ############################################################################
+# https://bugs.launchpad.net/percona-toolkit/+bug/1506748
+# test that setting sql_mode via --set-vars works 
+# ############################################################################
+
+# first we create a table with a valid default date
+$sb->load_file('master', "$sample/sql_mode_issue_lp1506748.sql");
+
+my $modes = new SqlModes($master_dbh, global =>1);
+
+# We clear all modes. In this state, setting an invalid default date generates
+# an error.
+$modes->set_mode_string('');
+
+# Now we run the command, but set sql_mode to allow invalid dates for 
+# the session.
+# While we're at it, test that we can set more than one mode by double escaping
+# the commas. (must be explained in docs)
+($output, $exit_status) = full_output(
+   sub { pt_online_schema_change::main(@args, 
+      "$master_dsn,D=test,t=lp1506748",
+      "--execute",
+      "--set-vars", "sql_mode=\'STRICT_ALL_TABLES\\,ALLOW_INVALID_DATES\'",
+      "--alter", "MODIFY COLUMN birthday DATE DEFAULT '1970-02-31'",
+      ) },
+);
+
+ok ((!$exit_status && $output =~ /success/i) , "--set-vars sql_mode=\\'a\\\\,b\\' works" ) 
+   or diag("[$output][$exit_status]");
+
+$master_dbh->do("drop database test");
+$modes->restore_original_modes();
 
 # #############################################################################
 # Done.
