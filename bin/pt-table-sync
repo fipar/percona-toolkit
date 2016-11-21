@@ -55,7 +55,7 @@ BEGIN {
 {
 package Percona::Toolkit;
 
-our $VERSION = '2.2.16';
+our $VERSION = '2.2.19';
 
 use strict;
 use warnings FATAL => 'all';
@@ -147,6 +147,7 @@ sub new {
       'default'    => 1,
       'cumulative' => 1,
       'negatable'  => 1,
+      'repeatable' => 1,  # means it can be specified more than once
    );
 
    my $self = {
@@ -337,6 +338,7 @@ sub _pod_to_specs {
             desc  => $para
                . (defined $attribs{default} ? " (default $attribs{default})" : ''),
             group => ($attribs{'group'} ? $attribs{'group'} : 'default'),
+            attributes => \%attribs
          };
       }
       while ( $para = <$fh> ) {
@@ -390,6 +392,7 @@ sub _parse_specs {
 
          $opt->{is_negatable}  = $opt->{spec} =~ m/!/        ? 1 : 0;
          $opt->{is_cumulative} = $opt->{spec} =~ m/\+/       ? 1 : 0;
+         $opt->{is_repeatable} = $opt->{attributes}->{repeatable} ? 1 : 0;
          $opt->{is_required}   = $opt->{desc} =~ m/required/ ? 1 : 0;
 
          $opt->{group} ||= 'default';
@@ -533,11 +536,21 @@ sub _set_option {
          return;
       }
       else {
-         $opt->{value} = $val;
+         if ($opt->{is_repeatable}) {
+            push @{$opt->{value}} , $val;
+         }
+         else {
+            $opt->{value} = $val;
+         }
       }
    }
    else {
-      $opt->{value} = $val;
+      if ($opt->{is_repeatable}) {
+         push @{$opt->{value}} , $val;
+      }
+      else {
+         $opt->{value} = $val;
+      }
    }
    $opt->{got} = 1;
    PTDEBUG && _d('Got option', $long, '=', $val);
@@ -557,6 +570,12 @@ sub get_opts {
 
    $self->{errors} = [];
 
+   if ( @ARGV && $ARGV[0] =~/^--config=/ ) {
+      $ARGV[0] = substr($ARGV[0],9);
+      $ARGV[0] =~ s/^'(.*)'$/$1/;
+      $ARGV[0] =~ s/^"(.*)"$/$1/;
+      $self->_set_option('config', shift @ARGV);
+   }
    if ( @ARGV && $ARGV[0] eq "--config" ) {
       shift @ARGV;
       $self->_set_option('config', shift @ARGV);
@@ -589,11 +608,12 @@ sub get_opts {
    if ( exists $self->{opts}->{version} && $self->{opts}->{version}->{got} ) {
       if ( $self->{version} ) {
          print $self->{version}, "\n";
+         exit 0;
       }
       else {
          print "Error parsing version.  See the VERSION section of the tool's documentation.\n";
+         exit 1;
       }
-      exit 1;
    }
 
    if ( @ARGV && $self->{strict} ) {
@@ -991,6 +1011,14 @@ sub _read_config_file {
          $parse  = 0;
          next LINE;
       }
+
+      if (  $parse
+            && !$self->has('version-check')
+            && $line =~ /version-check/
+      ) {
+         next LINE;
+      }
+
       if ( $parse
          && (my($opt, $arg) = $line =~ m/^\s*([^=\s]+?)(?:\s*=\s*(.*?)\s*)?$/)
       ) {
@@ -3515,7 +3543,7 @@ sub make_UPDATE {
    my $types = $self->{tbl_struct}->{type_for};
    return "UPDATE $self->{dst_db_tbl} SET "
       . join(', ', map {
-            my $is_char  = ($types->{$_} || '') =~ m/char|text/i;
+            my $is_char  = ($types->{$_} || '') =~ m/char|text|enum/i;
             my $is_float = ($types->{$_} || '') =~ m/float|double/i;
             $self->{Quoter}->quote($_)
             . '='
@@ -3564,7 +3592,7 @@ sub make_row {
       . ') VALUES ('
       . join(', ',
             map {
-               my $is_char  = ($type_for->{$_} || '') =~ m/char|text/i;
+               my $is_char  = ($type_for->{$_} || '') =~ m/char|text|enum/i;
                my $is_float = ($type_for->{$_} || '') =~ m/float|double/i;
                $q->quote_val(
                      $row->{$_},
@@ -3580,7 +3608,7 @@ sub make_where_clause {
    my @clauses = map {
       my $val = $row->{$_};
       my $sep = defined $val ? '=' : ' IS ';
-      my $is_char  = ($self->{tbl_struct}->{type_for}->{$_} || '') =~ m/char|text/i;
+      my $is_char  = ($self->{tbl_struct}->{type_for}->{$_} || '') =~ m/char|text|enum/i;
       my $is_float = ($self->{tbl_struct}->{type_for}->{$_} || '') =~ m/float|double/i;
       $self->{Quoter}->quote($_) . $sep . $self->{Quoter}->quote_val($val,
                                               is_char  => $is_char,
@@ -4839,6 +4867,9 @@ sub make_row_checksum {
          }
          elsif ( $args{trim} && $type =~ m/varchar/ ) {
             $result = "TRIM($result)";
+         }
+         elsif ( $type =~ m/binary|text|blob/ ) {
+            $result = "CRC32($result)";
          }
          $result;
       }
@@ -6458,7 +6489,7 @@ sub generate_del_stmt {
    my $index = $tp->find_best_index($tbl, $args{index});
    die "Cannot find an ascendable index in table" unless $index;
 
-   if ( $index ) {
+   if ( $index && $tbl->{keys}->{$index}->{is_unique}) {
       @del_cols = @{$tbl->{keys}->{$index}->{cols}};
    }
    else {
@@ -6560,23 +6591,22 @@ use warnings FATAL => 'all';
 use English qw(-no_match_vars);
 use constant PTDEBUG => $ENV{PTDEBUG} || 0;
 
-sub check_recursion_method {
+sub check_recursion_method {                                                       
    my ($methods) = @_;
-
-   if ( @$methods != 1 ) {
-      if ( grep({ !m/processlist|hosts/i } @$methods)
-            && $methods->[0] !~ /^dsn=/i )
-      {
-         die  "Invalid combination of recursion methods: "
-            . join(", ", map { defined($_) ? $_ : 'undef' } @$methods) . ". "
-            . "Only hosts and processlist may be combined.\n"
-      }
-   }
-   else {
+   if ( @$methods != 1 ) {                                                         
+      if ( grep({ !m/processlist|hosts/i } @$methods)                              
+            && $methods->[0] !~ /^dsn=/i ) 
+      {     
+         die  "Invalid combination of recursion methods: "                         
+            . join(", ", map { defined($_) ? $_ : 'undef' } @$methods) . ". "      
+            . "Only hosts and processlist may be combined.\n"                      
+      }                                                                            
+   }     
+   else {   
       my ($method) = @$methods;
-      die "Invalid recursion method: " . ( $method || 'undef' )
-         unless $method && $method =~ m/^(?:processlist$|hosts$|none$|dsn=)/i;
-   }
+      die "Invalid recursion method: " . ( $method || 'undef' )                    
+         unless $method && $method =~ m/^(?:processlist$|hosts$|none$|cluster$|dsn=)/i;     
+   }                                                                               
 }
 
 sub new {
@@ -6612,7 +6642,8 @@ sub get_slaves {
          die "I need a $arg argument" unless $args{$arg};
       }
       my ($dbh, $dsn) = @args{@required_args};
-      
+      my $o = $self->{OptionParser};
+
       $self->recurse_to_slaves(
          {  dbh       => $dbh,
             dsn       => $dsn,
@@ -6620,7 +6651,16 @@ sub get_slaves {
                my ( $dsn, $dbh, $level, $parent ) = @_;
                return unless $level;
                PTDEBUG && _d('Found slave:', $dp->as_string($dsn));
-               push @$slaves, $make_cxn->(dsn => $dsn, dbh => $dbh);
+               my $slave_dsn = $dsn;
+               if ($o->got('slave-user')) {
+                  $slave_dsn->{u} = $o->get('slave-user');
+                  PTDEBUG && _d("Using slave user ".$o->get('slave-user')." on ".$slave_dsn->{h}.":".$slave_dsn->{P});
+               }
+               if ($o->got('slave-password')) {
+                  $slave_dsn->{p} = $o->get('slave-password');
+                  PTDEBUG && _d("Slave password set");
+               }
+               push @$slaves, $make_cxn->(dsn => $slave_dsn, dbh => $dbh);
                return;
             },
          }
@@ -6818,7 +6858,7 @@ sub get_connected_slaves {
       die "You do not have the PROCESS privilege";
    }
 
-   $sql = 'SHOW PROCESSLIST';
+   $sql = 'SHOW FULL PROCESSLIST';
    PTDEBUG && _d($dbh, $sql);
    grep { $_->{command} =~ m/Binlog Dump/i }
    map  { # Lowercase the column names
@@ -11605,6 +11645,20 @@ the host2 DSN inherits the C<u> and C<p> DSN parts from the host1 DSN.
 Use the L<"--explain-hosts"> option to see how pt-table-sync will interpret
 the DSNs given on the command line.
 
+=head1 LIMITATIONS
+
+=over
+
+=item Replicas using row-based replication
+
+pt-table-sync requires statement-based replication when used with
+the L<"--sync-to-master"> or L<"--replicate"> option. 
+Therefore it will set C<binlog_format=STATEMENT> on the master
+for its session if required.
+To do this user must have C<SUPER> privilege.
+
+=back
+
 =head1 OUTPUT
 
 If you specify the L<"--verbose"> option, you'll see information about the 
@@ -12415,6 +12469,22 @@ The tool will examine server B's copy of the table.  If it looks like server B's
 data in table C<test.tbl1> is different from server A's copy, the tool will not
 sync that table on servers C and D.
 
+=item --slave-user
+
+type: string
+
+Sets the user to be used to connect to the slaves.
+This parameter allows you to have a different user with less privileges on the 
+slaves but that user must exist on all slaves.
+
+=item --slave-password
+
+type: string
+
+Sets the password to be used to connect to the slaves.
+It can be used with --slave-user and the password for the user must be the same
+on all slaves.
+
 =item --set-vars
 
 type: Array
@@ -12780,7 +12850,7 @@ software from Percona.
 
 =head1 COPYRIGHT, LICENSE, AND WARRANTY
 
-This program is copyright 2011-2015 Percona LLC and/or its affiliates,
+This program is copyright 2011-2016 Percona LLC and/or its affiliates,
 2007-2011 Baron Schwartz.
 
 THIS PROGRAM IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS OR IMPLIED
@@ -12799,6 +12869,6 @@ Place, Suite 330, Boston, MA  02111-1307  USA.
 
 =head1 VERSION
 
-pt-table-sync 2.2.16
+pt-table-sync 2.2.19
 
 =cut

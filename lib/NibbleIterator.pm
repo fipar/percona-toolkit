@@ -138,7 +138,11 @@ sub new {
       # ORDER BY are the same for all statements.  FORCE IDNEX and ORDER BY
       # are needed to ensure deterministic nibbling.
       my $from     = "$tbl->{name} FORCE INDEX(`$index`)";
-      my $order_by = join(', ', map {$q->quote($_)} @{$index_cols});
+      my $order_by = join(', ', map { $tbl->{tbl_struct}->{type_for}->{$_} eq 'enum' 
+                                        ? "CONCAT(".$q->quote($_).")" : $q->quote($_)} @{$index_cols});
+
+      my $order_by_dec = join(' DESC,', map { $tbl->{tbl_struct}->{type_for}->{$_} eq 'enum' 
+                                        ? "CONCAT(".$q->quote($_).")" : $q->quote($_)} @{$index_cols});
 
       # The real first row in the table.  Usually we start nibbling from
       # this row.  Called once in _get_bounds().
@@ -177,7 +181,7 @@ sub new {
          . " FROM $from"
          . ($where ? " WHERE $where" : '')
          . " ORDER BY "
-         . join(' DESC, ', map {$q->quote($_)} @{$index_cols}) . ' DESC'
+         . $order_by_dec . ' DESC'
          . " LIMIT 1"
          . " /*last upper boundary*/";
       PTDEBUG && _d('Last upper boundary statement:', $last_ub_sql);
@@ -259,6 +263,8 @@ sub new {
    $self->{have_rows}  = 0;
    $self->{rowno}      = 0;
    $self->{oktonibble} = 1;
+   $self->{pause_file} = $nibble_params->{pause_file};
+   $self->{sleep}      = $args{sleep} || 60;
 
    return bless $self, $class;
 }
@@ -300,6 +306,24 @@ sub next {
    # If there's another nibble, fetch the rows within it.
    NIBBLE:
    while ( $self->{have_rows} || $self->_next_boundaries() ) {
+
+      if ($self->{pause_file}) {
+         while(-f $self->{pause_file}) {
+            print "Sleeping $self->{sleep} seconds because $self->{pause_file} exists\n";
+            my $dbh = $self->{Cxn}->dbh();
+            if ( !$dbh || !$dbh->ping() ) {
+               eval { $dbh = $self->{Cxn}->connect() }; # connect or die trying
+               if ( $EVAL_ERROR ) {
+                  chomp $EVAL_ERROR;
+                  die "Lost connection to " . $self->{Cxn}->name() . " while waiting for "
+                  . "replica lag ($EVAL_ERROR)\n";
+               }
+            }
+            $dbh->do("SELECT 'nibble iterator keepalive'");
+            sleep($self->{sleep});
+         }
+      }
+  
       # If no rows, then we just got the next boundaries, which start
       # the next nibble.
       if ( !$self->{have_rows} ) {
@@ -337,6 +361,7 @@ sub next {
       }
       $self->{rowno}     = 0;
       $self->{have_rows} = 0;
+      
    }
 
    PTDEBUG && _d('Done nibbling');
@@ -489,10 +514,13 @@ sub can_nibble {
 
    # The table can be nibbled if this point is reached, else we would have
    # died earlier.  Return some values about nibbling the table.
+   my $pause_file = ($o->has('pause-file') && $o->get('pause-file')) || undef;
+   
    return {
       row_est     => $row_est,      # nibble about this many rows
       index       => $index,        # using this index
       one_nibble  => $one_nibble,   # if the table fits in one nibble/chunk
+      pause_file  => $pause_file,
    };
 }
 
@@ -503,23 +531,33 @@ sub _find_best_index {
    my $tbl_struct = $tbl->{tbl_struct};
    my $indexes    = $tbl_struct->{keys};
 
+   my $best_index;
    my $want_index = $args{chunk_index};
+   # check if the user defined index exists
+   # and declare it best_index if so
    if ( $want_index ) {
       PTDEBUG && _d('User wants to use index', $want_index);
       if ( !exists $indexes->{$want_index} ) {
          PTDEBUG && _d('Cannot use user index because it does not exist');
          $want_index = undef;
+      } else {
+         $best_index = $want_index;
       }
    }
 
-   if ( !$want_index && $args{mysql_index} ) {
+   # if no user definded index or user defined index not valid
+   # consider mysql's preferred index a candidate
+   if ( !$best_index && !$want_index && $args{mysql_index} ) {
       PTDEBUG && _d('MySQL wants to use index', $args{mysql_index});
       $want_index = $args{mysql_index};
    }
 
-   my $best_index;
+
    my @possible_indexes;
-   if ( $want_index ) {
+   # if haven't got a valid user chosen index
+   # check if mysql's preferred index is unique, and if so
+   # consider it the best, otherwise include it with other candidates
+   if ( !$best_index && $want_index ) {
       if ( $indexes->{$want_index}->{is_unique} ) {
          PTDEBUG && _d('Will use wanted index');
          $best_index = $want_index;
@@ -529,7 +567,10 @@ sub _find_best_index {
          push @possible_indexes, $want_index;
       }
    }
-   else {
+   
+   # still no best index?
+   # prefer unique index. otherwise put in candidates array. 
+   if (!$best_index) {
       PTDEBUG && _d('Auto-selecting best index');
       foreach my $index ( $tp->sort_indexes($tbl_struct) ) {
          if ( $index eq 'PRIMARY' || $indexes->{$index}->{is_unique} ) {
@@ -542,6 +583,7 @@ sub _find_best_index {
       }
    }
 
+   # choose the one with best cardinality 
    if ( !$best_index && @possible_indexes ) {
       PTDEBUG && _d('No PRIMARY or unique indexes;',
          'will use index with highest cardinality');

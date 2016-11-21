@@ -615,6 +615,13 @@ sub get_opts {
    $self->{errors} = [];
 
    # --config is special-case; parse them manually and remove them from @ARGV
+   if ( @ARGV && $ARGV[0] =~/^--config=/ ) {
+      $ARGV[0] = substr($ARGV[0],9);
+      # Clean '" independently because we need to match start/end with the same char ' or "
+      $ARGV[0] =~ s/^'(.*)'$/$1/;
+      $ARGV[0] =~ s/^"(.*)"$/$1/;
+      $self->_set_option('config', shift @ARGV);
+   }
    if ( @ARGV && $ARGV[0] eq "--config" ) {
       shift @ARGV;
       $self->_set_option('config', shift @ARGV);
@@ -651,11 +658,12 @@ sub get_opts {
    if ( exists $self->{opts}->{version} && $self->{opts}->{version}->{got} ) {
       if ( $self->{version} ) {
          print $self->{version}, "\n";
+         exit 0;
       }
       else {
          print "Error parsing version.  See the VERSION section of the tool's documentation.\n";
+         exit 1;
       }
-      exit 1;
    }
 
    if ( @ARGV && $self->{strict} ) {

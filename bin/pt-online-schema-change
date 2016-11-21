@@ -55,7 +55,7 @@ BEGIN {
 {
 package Percona::Toolkit;
 
-our $VERSION = '2.2.16';
+our $VERSION = '2.2.19';
 
 use strict;
 use warnings FATAL => 'all';
@@ -570,6 +570,12 @@ sub get_opts {
 
    $self->{errors} = [];
 
+   if ( @ARGV && $ARGV[0] =~/^--config=/ ) {
+      $ARGV[0] = substr($ARGV[0],9);
+      $ARGV[0] =~ s/^'(.*)'$/$1/;
+      $ARGV[0] =~ s/^"(.*)"$/$1/;
+      $self->_set_option('config', shift @ARGV);
+   }
    if ( @ARGV && $ARGV[0] eq "--config" ) {
       shift @ARGV;
       $self->_set_option('config', shift @ARGV);
@@ -602,11 +608,12 @@ sub get_opts {
    if ( exists $self->{opts}->{version} && $self->{opts}->{version}->{got} ) {
       if ( $self->{version} ) {
          print $self->{version}, "\n";
+         exit 0;
       }
       else {
          print "Error parsing version.  See the VERSION section of the tool's documentation.\n";
+         exit 1;
       }
-      exit 1;
    }
 
    if ( @ARGV && $self->{strict} ) {
@@ -3051,7 +3058,7 @@ sub generate_del_stmt {
    my $index = $tp->find_best_index($tbl, $args{index});
    die "Cannot find an ascendable index in table" unless $index;
 
-   if ( $index ) {
+   if ( $index && $tbl->{keys}->{$index}->{is_unique}) {
       @del_cols = @{$tbl->{keys}->{$index}->{cols}};
    }
    else {
@@ -4107,7 +4114,8 @@ sub get_slaves {
          die "I need a $arg argument" unless $args{$arg};
       }
       my ($dbh, $dsn) = @args{@required_args};
-      
+      my $o = $self->{OptionParser};
+
       $self->recurse_to_slaves(
          {  dbh       => $dbh,
             dsn       => $dsn,
@@ -4115,7 +4123,16 @@ sub get_slaves {
                my ( $dsn, $dbh, $level, $parent ) = @_;
                return unless $level;
                PTDEBUG && _d('Found slave:', $dp->as_string($dsn));
-               push @$slaves, $make_cxn->(dsn => $dsn, dbh => $dbh);
+               my $slave_dsn = $dsn;
+               if ($o->got('slave-user')) {
+                  $slave_dsn->{u} = $o->get('slave-user');
+                  PTDEBUG && _d("Using slave user ".$o->get('slave-user')." on ".$slave_dsn->{h}.":".$slave_dsn->{P});
+               }
+               if ($o->got('slave-password')) {
+                  $slave_dsn->{p} = $o->get('slave-password');
+                  PTDEBUG && _d("Slave password set");
+               }
+               push @$slaves, $make_cxn->(dsn => $slave_dsn, dbh => $dbh);
                return;
             },
          }
@@ -4313,7 +4330,7 @@ sub get_connected_slaves {
       die "You do not have the PROCESS privilege";
    }
 
-   $sql = 'SHOW PROCESSLIST';
+   $sql = 'SHOW FULL PROCESSLIST';
    PTDEBUG && _d($dbh, $sql);
    grep { $_->{command} =~ m/Binlog Dump/i }
    map  { # Lowercase the column names
@@ -4825,6 +4842,24 @@ sub wait {
    my $worst;  # most lagging slave
    my $pr_callback;
    my $pr_first_report;
+
+   my $pr_refresh_slave_list = sub {
+      my ($self) = @_;
+      my ($slaves, $refresher) = ($self->{slaves}, $self->{get_slaves_cb});
+      return if ( not defined $refresher );
+      my $before = join ' ', sort map {$_->name()} @$slaves;
+      $slaves = $refresher->();
+      my $after = join ' ', sort map {$_->name()} @$slaves;
+      if ($before ne $after) {
+         $self->{slaves} = $slaves;
+         printf "Slave set to watch has changed\n  Was: %s\n  Now: %s\n",
+            $before, $after;
+      }
+      return($self->{slaves});
+   };
+
+   $slaves = $pr_refresh_slave_list->($self);
+
    if ( $pr ) {
       $pr_callback = sub {
          my ($fraction, $elapsed, $remaining, $eta, $completed) = @_;
@@ -4852,6 +4887,14 @@ sub wait {
    my @lagged_slaves = map { {cxn=>$_, lag=>undef} } @$slaves;  
    while ( $oktorun->() && @lagged_slaves ) {
       PTDEBUG && _d('Checking slave lag');
+
+      $slaves = $pr_refresh_slave_list->($self);
+      my $watched = 0;
+      @lagged_slaves = grep {
+         my $slave_name = $_->{cxn}->name();
+         grep {$slave_name eq $_->name()} @{$slaves || []}
+                             } @lagged_slaves;
+
       for my $i ( 0..$#lagged_slaves ) {
          my $lag = $get_lag->($lagged_slaves[$i]->{cxn});
          PTDEBUG && _d($lagged_slaves[$i]->{cxn}->name(),
@@ -4893,6 +4936,9 @@ sub wait {
 
 sub _d {
    my ($package, undef, $line) = caller 0;
+   #   Backslash found where operator expected at ./pt-online-schema-change line 4933, near "@_ = map { (my $temp = $_) =~ s/\"
+   # (Might be a runaway multi-line // string starting on line 4889)
+
    @_ = map { (my $temp = $_) =~ s/\n/\n# /g; $temp; }
         map { defined $_ ? $_ : 'undef' }
         @_;
@@ -5375,7 +5421,11 @@ sub new {
       PTDEBUG && _d('Ascend params:', Dumper($asc));
 
       my $from     = "$tbl->{name} FORCE INDEX(`$index`)";
-      my $order_by = join(', ', map {$q->quote($_)} @{$index_cols});
+      my $order_by = join(', ', map { $tbl->{tbl_struct}->{type_for}->{$_} eq 'enum' 
+                                        ? "CONCAT(".$q->quote($_).")" : $q->quote($_)} @{$index_cols});
+
+      my $order_by_dec = join(' DESC,', map { $tbl->{tbl_struct}->{type_for}->{$_} eq 'enum' 
+                                        ? "CONCAT(".$q->quote($_).")" : $q->quote($_)} @{$index_cols});
 
       my $first_lb_sql
          = "SELECT /*!40001 SQL_NO_CACHE */ "
@@ -5407,7 +5457,7 @@ sub new {
          . " FROM $from"
          . ($where ? " WHERE $where" : '')
          . " ORDER BY "
-         . join(' DESC, ', map {$q->quote($_)} @{$index_cols}) . ' DESC'
+         . $order_by_dec . ' DESC'
          . " LIMIT 1"
          . " /*last upper boundary*/";
       PTDEBUG && _d('Last upper boundary statement:', $last_ub_sql);
@@ -5479,6 +5529,8 @@ sub new {
    $self->{have_rows}  = 0;
    $self->{rowno}      = 0;
    $self->{oktonibble} = 1;
+   $self->{pause_file} = $nibble_params->{pause_file};
+   $self->{sleep}      = $args{sleep} || 60;
 
    return bless $self, $class;
 }
@@ -5517,6 +5569,24 @@ sub next {
 
    NIBBLE:
    while ( $self->{have_rows} || $self->_next_boundaries() ) {
+
+      if ($self->{pause_file}) {
+         while(-f $self->{pause_file}) {
+            print "Sleeping $self->{sleep} seconds because $self->{pause_file} exists\n";
+            my $dbh = $self->{Cxn}->dbh();
+            if ( !$dbh || !$dbh->ping() ) {
+               eval { $dbh = $self->{Cxn}->connect() }; # connect or die trying
+               if ( $EVAL_ERROR ) {
+                  chomp $EVAL_ERROR;
+                  die "Lost connection to " . $self->{Cxn}->name() . " while waiting for "
+                  . "replica lag ($EVAL_ERROR)\n";
+               }
+            }
+            $dbh->do("SELECT 'nibble iterator keepalive'");
+            sleep($self->{sleep});
+         }
+      }
+  
       if ( !$self->{have_rows} ) {
          $self->{nibbleno}++;
          PTDEBUG && _d('Nibble:', $self->{nibble_sth}->{Statement}, 'params:',
@@ -5546,6 +5616,7 @@ sub next {
       }
       $self->{rowno}     = 0;
       $self->{have_rows} = 0;
+      
    }
 
    PTDEBUG && _d('Done nibbling');
@@ -5681,10 +5752,13 @@ sub can_nibble {
       die "There is no good index and the table is oversized.";
    }
 
+   my $pause_file = ($o->has('pause-file') && $o->get('pause-file')) || undef;
+   
    return {
       row_est     => $row_est,      # nibble about this many rows
       index       => $index,        # using this index
       one_nibble  => $one_nibble,   # if the table fits in one nibble/chunk
+      pause_file  => $pause_file,
    };
 }
 
@@ -5695,23 +5769,26 @@ sub _find_best_index {
    my $tbl_struct = $tbl->{tbl_struct};
    my $indexes    = $tbl_struct->{keys};
 
+   my $best_index;
    my $want_index = $args{chunk_index};
    if ( $want_index ) {
       PTDEBUG && _d('User wants to use index', $want_index);
       if ( !exists $indexes->{$want_index} ) {
          PTDEBUG && _d('Cannot use user index because it does not exist');
          $want_index = undef;
+      } else {
+         $best_index = $want_index;
       }
    }
 
-   if ( !$want_index && $args{mysql_index} ) {
+   if ( !$best_index && !$want_index && $args{mysql_index} ) {
       PTDEBUG && _d('MySQL wants to use index', $args{mysql_index});
       $want_index = $args{mysql_index};
    }
 
-   my $best_index;
+
    my @possible_indexes;
-   if ( $want_index ) {
+   if ( !$best_index && $want_index ) {
       if ( $indexes->{$want_index}->{is_unique} ) {
          PTDEBUG && _d('Will use wanted index');
          $best_index = $want_index;
@@ -5721,7 +5798,8 @@ sub _find_best_index {
          push @possible_indexes, $want_index;
       }
    }
-   else {
+   
+   if (!$best_index) {
       PTDEBUG && _d('Auto-selecting best index');
       foreach my $index ( $tp->sort_indexes($tbl_struct) ) {
          if ( $index eq 'PRIMARY' || $indexes->{$index}->{is_unique} ) {
@@ -8206,8 +8284,11 @@ sub main {
    # think that can be less confusing. Also, the $set_on_connect variable can be
    # inlined into this subroutine. Many of our tools have a get_dbh() subroutine
    # and it might be good to just make a convention of it.
+   # Note: args->{errok} to tolerate connection error
    my $make_cxn = sub {
       my (%args) = @_;
+      my $errok = $args{errok};
+      delete($args{errok});
       my $cxn = Cxn->new(
          %args,
          DSNParser    => $dp,
@@ -8216,7 +8297,12 @@ sub main {
       );
       eval { $cxn->connect() };  # connect or die trying
       if ( $EVAL_ERROR ) {
-         die "Cannot connect to MySQL: $EVAL_ERROR\n";
+         if ($errok) {
+            printf "IGNORING CONNECTION ERROR: %s\n",
+              $EVAL_ERROR;
+         } else {
+            die "Cannot connect to MySQL: $EVAL_ERROR\n";
+         }
       }
       return $cxn;
    };
@@ -8355,13 +8441,21 @@ sub main {
          Quoter       => $q,
       );
 
-      $slaves = $ms->get_slaves(
-         dbh          => $cxn->dbh(),
-         dsn          => $cxn->dsn(),
-         make_cxn     => sub {
-            return $make_cxn->(@_, prev_dsn => $cxn->dsn());
-         },
-      );
+      my $get_slaves_cb = sub {
+         my ($intolerant) = @_;
+         return( $ms->get_slaves(
+            dbh          => $cxn->dbh(),
+            dsn          => $cxn->dsn(),
+            make_cxn     => sub {
+               return $make_cxn->(@_, prev_dsn => $cxn->dsn(),
+                 errok => (not $intolerant));
+                                },
+                                )
+               );
+                              };
+
+      ### first ever call only: do not tolerate connection errors
+      $slaves = $get_slaves_cb->('intolerant');
       PTDEBUG && _d(scalar @$slaves, 'slaves found');
       if ( scalar @$slaves ) {
          print "Found " . scalar(@$slaves) . " slaves:\n";
@@ -8385,6 +8479,7 @@ sub main {
             prev_dsn   => $cxn->dsn(),
          );
          $slave_lag_cxns = [ $cxn ];
+         $get_slaves_cb = undef;
       }
       else {
          PTDEBUG && _d('Will check slave lag on all slaves');
@@ -8493,11 +8588,12 @@ sub main {
       }
 
       $replica_lag = new ReplicaLagWaiter(
-         slaves   => $slave_lag_cxns,
-         max_lag  => $o->get('max-lag'),
-         oktorun  => sub { return $oktorun },
-         get_lag  => $get_lag,
-         sleep    => $sleep,
+         slaves          => $slave_lag_cxns,
+         get_slaves_cb   => $get_slaves_cb,
+         max_lag         => $o->get('max-lag'),
+         oktorun         => sub { return $oktorun },
+         get_lag         => $get_lag,
+         sleep           => $sleep,
       );
 
       my $get_status;
@@ -9546,6 +9642,7 @@ sub main {
 
    my $old_tbl;
    if ( $o->get('swap-tables') ) {
+
       eval {
          $old_tbl = swap_tables(
             orig_tbl      => $orig_tbl,
@@ -10030,13 +10127,23 @@ sub create_new_table {
       # This is in contrast to previous behavior were we added underscores
       # indefinitely, sometimes exceeding the allowed name limit
       # https://bugs.launchpad.net/percona-toolkit/+bug/1215587 
-      if ( $sql =~ /CONSTRAINT `_/ ) {
-         $sql =~ s/^  CONSTRAINT `_/  CONSTRAINT `/gm;
-      } else {
-         $sql =~ s/^  CONSTRAINT `/  CONSTRAINT `_/gm;
-      }
+      $sql =~ s/^  CONSTRAINT `(_?)/'  CONSTRAINT `'.($1 eq '' ? '_' : '')/gme;
+
       if ( $o->get('default-engine') ) {
          $sql =~ s/\s+ENGINE=\S+//;
+      }
+      if ( $o->get('data-dir') && !$o->got('remove-data-dir') ) {
+          if ( (-d $o->get('data-dir')) && (-w $o->get('data-dir')) ){
+             $sql =~ s/DATA DIRECTORY='.*?'//; 
+             $sql .= sprintf(" DATA DIRECTORY='%s' ",$o->get('data-dir'));
+             PTDEBUG && _d("adding data dir ".$o->get('data-dir'));
+          } else {
+              die $o->get('data-dir') . " is not a directory or it is not writable";
+          }
+      }
+      if ( $o->got('remove-data-dir') ) {
+         $sql =~ s/DATA DIRECTORY='.*?'//; 
+         PTDEBUG && _d("removing data dir");
       }
       PTDEBUG && _d($sql);
       eval {
@@ -10084,7 +10191,7 @@ sub swap_tables {
 
    my $prefix       = '_';
    my $table_name   = $orig_tbl->{tbl} . ($args{suffix} || '');
-   my $name_tries   = 10;  # don't try forever
+   my $name_tries   = 20;  # don't try forever
    my $table_exists = qr/table.+?already exists/i;
 
    # This sub only works for --execute.  Since the options are
@@ -10119,6 +10226,16 @@ sub swap_tables {
 
       print ts("Swapping tables...\n");
       while ( $name_tries-- ) {
+       
+         # https://bugs.launchpad.net/percona-toolkit/+bug/1526105
+         if ( $name_tries <= 10 ) { # we've already added 10 underscores?
+            # time to try a small random string
+            my @chars = ("A".."Z", "0".."9");
+            $prefix = '';
+            $prefix .= $chars[rand @chars] for 1..6;
+            $prefix .= "_";  
+         }
+
          $table_name = $prefix . $table_name;
 
          if ( length($table_name) > 64 ) {
@@ -10131,6 +10248,7 @@ sub swap_tables {
          my $sql = "RENAME TABLE $orig_tbl->{name} "
                  . "TO " . $q->quote($orig_tbl->{db}, $table_name)
                  . ", $new_tbl->{name} TO $orig_tbl->{name}"; 
+
          eval {
             osc_retry(
                Cxn     => $cxn,
@@ -10150,6 +10268,7 @@ sub swap_tables {
                   # other purposes.
                   $table_exists,
                ],
+               operation => "swap_tables",
             );
          };
          if ( my $e = $EVAL_ERROR ) {
@@ -10169,10 +10288,8 @@ sub swap_tables {
             name => $q->quote($orig_tbl->{db}, $table_name),
          };
       }
-
+     
       # This shouldn't happen.
-      # Here and in the attempt to find a new table name we probably ought to
-      # use --tries (and maybe a Retry object?)
       die ts("Failed to find a unique old table name after "
          . "serveral attempts.\n");
    }
@@ -10699,6 +10816,9 @@ sub osc_retry {
          PTDEBUG && _d('Retry fail:', $error);
 
          if ( $ignore_errors ) {
+            if ($error =~ /table.+?already exists/i) {
+               PTDEBUG && _d('Aborting retries because of table name conflict. Trying with different name');
+            }
             return 0 if grep { $error =~ $_ } @$ignore_errors;
          }
 
@@ -10900,6 +11020,7 @@ sub sig_int {
    }
    exit 1;
 }
+
 
 sub _d {
    my ($package, undef, $line) = caller 0;
@@ -11475,6 +11596,21 @@ cause unintended changes on replicas which use a different engine for
 the same table.  Specifying this option causes the new table to be
 created with the system's default engine.
 
+=item --data-dir
+
+type: string
+
+Create the new table on a different partition using the DATA DIRECTORY feature.
+Only available on 5.6+. This parameter is ignored if it is used at the same time
+than remove-data-dir.
+
+=item --remove-data-dir
+
+default: no
+
+If the original table was created using the DATA DIRECTORY feature, remove it and create 
+the new table in MySQL default directory without creating a new isl file.
+
 =item --defaults-file
 
 short form: -F; type: string
@@ -11624,6 +11760,12 @@ short form: -p; type: string
 Password to use when connecting.
 If password contains commas they must be escaped with a backslash: "exam\,ple"
 
+=item --pause-file
+
+type: string 
+
+Execution will be paused while the file specified by this param exists.
+
 =item --pid
 
 type: string
@@ -11718,6 +11860,25 @@ To make the tool monitor only the hosts 10.10.1.16 and 10.10.1.17 for
 replication lag, insert the values C<h=10.10.1.16> and C<h=10.10.1.17> into the
 table. Currently, the DSNs are ordered by id, but id and parent_id are otherwise
 ignored.  
+
+You can change the list of hosts while OSC is executing:
+if you change the contents of the DSN table, OSC will pick it up very soon.
+
+=item --slave-user
+
+type: string
+
+Sets the user to be used to connect to the slaves.
+This parameter allows you to have a different user with less privileges on the 
+slaves but that user must exist on all slaves.
+
+=item --slave-password
+
+type: string
+
+Sets the password to be used to connect to the slaves.
+It can be used with --slave-user and the password for the user must be the same
+on all slaves.
 
 =item --set-vars
 
@@ -11915,6 +12076,147 @@ to a hook, search for the hook's name in the tool's source code, like:
 
 The comment C<# --plugin hook> precedes every hook call.
 
+Here's a plugin file template for all hooks:
+
+   package pt_online_schema_change_plugin;
+
+   use strict;
+
+   sub new {
+      my ($class, %args) = @_;
+      my $self = { %args };
+      return bless $self, $class;
+   }
+
+   sub init {
+      my ($self, %args) = @_;
+      print "PLUGIN init\n";
+   }
+
+   sub before_create_new_table {
+      my ($self, %args) = @_;
+      print "PLUGIN before_create_new_table\n";
+   }
+
+   sub after_create_new_table {
+      my ($self, %args) = @_;
+      print "PLUGIN after_create_new_table\n";
+   }
+
+   sub before_alter_new_table {
+      my ($self, %args) = @_;
+      print "PLUGIN before_alter_new_table\n";
+   }
+
+   sub after_alter_new_table {
+      my ($self, %args) = @_;
+      print "PLUGIN after_alter_new_table\n";
+   }
+
+   sub before_create_triggers {
+      my ($self, %args) = @_;
+      print "PLUGIN before_create_triggers\n";
+   } 
+
+  sub after_create_triggers {
+      my ($self, %args) = @_;
+      print "PLUGIN after_create_triggers\n";
+   }
+
+   sub before_copy_rows {
+      my ($self, %args) = @_;
+      print "PLUGIN before_copy_rows\n";
+   }
+
+   sub after_copy_rows {
+      my ($self, %args) = @_;
+      print "PLUGIN after_copy_rows\n";
+   }
+
+   sub before_swap_tables {
+      my ($self, %args) = @_;
+      print "PLUGIN before_swap_tables\n";
+   }
+
+   sub after_swap_tables {
+      my ($self, %args) = @_;
+      print "PLUGIN after_swap_tables\n";
+   }
+
+   sub before_update_foreign_keys {
+      my ($self, %args) = @_;
+      print "PLUGIN before_update_foreign_keys\n";
+   }
+
+   sub after_update_foreign_keys {
+      my ($self, %args) = @_;
+      print "PLUGIN after_update_foreign_keys\n";
+   }
+
+   sub before_drop_old_table {
+      my ($self, %args) = @_;
+      print "PLUGIN before_drop_old_table\n";
+   }
+
+   sub after_drop_old_table {
+      my ($self, %args) = @_;
+      print "PLUGIN after_drop_old_table\n";
+   }
+
+   sub before_drop_triggers {
+      my ($self, %args) = @_;
+      print "PLUGIN before_drop_triggers\n";
+   }
+
+   sub before_exit {
+      my ($self, %args) = @_;
+      print "PLUGIN before_exit\n";
+   }
+
+   sub get_slave_lag {
+      my ($self, %args) = @_;
+      print "PLUGIN get_slave_lag\n";
+
+      return sub { return 0; };
+   }
+
+   1;
+
+Notice that C<get_slave_lag> must return a function reference; 
+ideally one that returns actual slave lag, not simply zero like in the example.
+
+Here's an example that actually does something:
+
+   package pt_online_schema_change_plugin;
+
+   use strict;
+
+   sub new {
+      my ($class, %args) = @_;
+      my $self = { %args };
+      return bless $self, $class;
+   }
+
+   sub after_create_new_table {
+      my ($self, %args) = @_;
+      my $new_tbl = $args{new_tbl};
+      my $dbh     = $self->{cxn}->dbh;
+      my $row = $dbh->selectrow_arrayref("SHOW CREATE TABLE $new_tbl->{name}");
+      warn "after_create_new_table: $row->[1]\n\n";
+   }
+
+   sub after_alter_new_table {
+      my ($self, %args) = @_;
+      my $new_tbl = $args{new_tbl};
+      my $dbh     = $self->{cxn}->dbh;
+      my $row = $dbh->selectrow_arrayref("SHOW CREATE TABLE $new_tbl->{name}");
+      warn "after_alter_new_table: $row->[1]\n\n";
+   }
+
+   1;
+
+You could use this with L<"--dry-run"> to check how the table will look before and after.
+
 Please contact Percona if you have questions or need help.
 
 =head1 DSN OPTIONS
@@ -12068,7 +12370,7 @@ software from Percona.
 
 =head1 COPYRIGHT, LICENSE, AND WARRANTY
 
-This program is copyright 2011-2015 Percona LLC and/or its affiliates.
+This program is copyright 2011-2016 Percona LLC and/or its affiliates.
 
 THIS PROGRAM IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS OR IMPLIED
 WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTIES OF
@@ -12086,6 +12388,6 @@ Place, Suite 330, Boston, MA  02111-1307  USA.
 
 =head1 VERSION
 
-pt-online-schema-change 2.2.16
+pt-online-schema-change 2.2.19
 
 =cut

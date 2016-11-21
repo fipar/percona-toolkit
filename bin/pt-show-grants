@@ -16,6 +16,7 @@ BEGIN {
       OptionParser
       DSNParser
       Daemon
+      VersionCompare
    ));
 }
 
@@ -59,6 +60,7 @@ sub new {
       'default'    => 1,
       'cumulative' => 1,
       'negatable'  => 1,
+      'repeatable' => 1,  # means it can be specified more than once
    );
 
    my $self = {
@@ -249,6 +251,7 @@ sub _pod_to_specs {
             desc  => $para
                . (defined $attribs{default} ? " (default $attribs{default})" : ''),
             group => ($attribs{'group'} ? $attribs{'group'} : 'default'),
+            attributes => \%attribs
          };
       }
       while ( $para = <$fh> ) {
@@ -302,6 +305,7 @@ sub _parse_specs {
 
          $opt->{is_negatable}  = $opt->{spec} =~ m/!/        ? 1 : 0;
          $opt->{is_cumulative} = $opt->{spec} =~ m/\+/       ? 1 : 0;
+         $opt->{is_repeatable} = $opt->{attributes}->{repeatable} ? 1 : 0;
          $opt->{is_required}   = $opt->{desc} =~ m/required/ ? 1 : 0;
 
          $opt->{group} ||= 'default';
@@ -445,11 +449,21 @@ sub _set_option {
          return;
       }
       else {
-         $opt->{value} = $val;
+         if ($opt->{is_repeatable}) {
+            push @{$opt->{value}} , $val;
+         }
+         else {
+            $opt->{value} = $val;
+         }
       }
    }
    else {
-      $opt->{value} = $val;
+      if ($opt->{is_repeatable}) {
+         push @{$opt->{value}} , $val;
+      }
+      else {
+         $opt->{value} = $val;
+      }
    }
    $opt->{got} = 1;
    PTDEBUG && _d('Got option', $long, '=', $val);
@@ -469,6 +483,12 @@ sub get_opts {
 
    $self->{errors} = [];
 
+   if ( @ARGV && $ARGV[0] =~/^--config=/ ) {
+      $ARGV[0] = substr($ARGV[0],9);
+      $ARGV[0] =~ s/^'(.*)'$/$1/;
+      $ARGV[0] =~ s/^"(.*)"$/$1/;
+      $self->_set_option('config', shift @ARGV);
+   }
    if ( @ARGV && $ARGV[0] eq "--config" ) {
       shift @ARGV;
       $self->_set_option('config', shift @ARGV);
@@ -501,11 +521,12 @@ sub get_opts {
    if ( exists $self->{opts}->{version} && $self->{opts}->{version}->{got} ) {
       if ( $self->{version} ) {
          print $self->{version}, "\n";
+         exit 0;
       }
       else {
          print "Error parsing version.  See the VERSION section of the tool's documentation.\n";
+         exit 1;
       }
-      exit 1;
    }
 
    if ( @ARGV && $self->{strict} ) {
@@ -904,9 +925,9 @@ sub _read_config_file {
          next LINE;
       }
 
-      if (  $parse 
-            && !$self->has('version-check') 
-            && $line =~ /version-check/ 
+      if (  $parse
+            && !$self->has('version-check')
+            && $line =~ /version-check/
       ) {
          next LINE;
       }
@@ -1728,6 +1749,53 @@ sub _d {
 # ###########################################################################
 
 # ###########################################################################
+# VersionCompare package
+# This package is a copy without comments from the original.  The original
+# with comments and its test file can be found in the Bazaar repository at,
+#   lib/VersionCompare.pm
+#   t/lib/VersionCompare.t
+# See https://launchpad.net/percona-toolkit for more information.
+# ###########################################################################
+{
+package VersionCompare;
+
+use strict;
+use English qw(-no_match_vars);
+use constant PTDEBUG => $ENV{PTDEBUG} || 0;
+
+sub cmp {
+   my ($v1, $v2) = @_;
+
+   $v1 =~ s/[^\d\.]//;
+   $v2 =~ s/[^\d\.]//;
+
+   my @a = ( $v1 =~ /(\d+)\.?/g ); 
+   my @b = ( $v2 =~ /(\d+)\.?/g ); 
+   foreach my $n1 (@a) {
+      $n1 += 0;
+      if (!@b) {
+         return 1;
+      }  
+      my $n2 = shift @b;
+      $n2 += 0;
+      if ($n1 == $n2) {
+          next;
+      }
+      else {
+         return $n1 <=> $n2;
+      }  
+   }  
+   return @b ? -1 : 0;
+}
+
+
+1;
+}
+# ###########################################################################
+# End VersionCompare package
+# ###########################################################################
+
+# ###########################################################################
 # This is a combination of modules and programs in one -- a runnable module.
 # http://www.perl.com/pub/a/2006/07/13/lightning-articles.html?page=last
 # Or, look it up in the Camel book on pages 642 and 643 in the 3rd edition.
@@ -1826,6 +1894,7 @@ sub main {
                               { AutoCommit => 1, });
 
    my ( $version, $ts ) = $dbh->selectrow_array("SELECT VERSION(), NOW()");
+   
    print join("\n",
       "-- Grants dumped by pt-show-grants",
       "-- Dumped from server " . ($dbh->{mysql_hostinfo} || '')
@@ -1856,6 +1925,28 @@ sub main {
          PTDEBUG && _d('Checking user', $user_host);
       }
 
+      # If MySQL 5.7.6+ then we need to use SHOW CREATE USER
+      my @create_user;
+      if (( VersionCompare::cmp($version, '5.7.6') >= 0 ) &&
+          ( VersionCompare::cmp($version, '10.0.0') <= 0 )) {
+         eval {
+            @create_user = @{ $dbh->selectcol_arrayref("SHOW CREATE USER $user_host") };
+         };
+         if ( $EVAL_ERROR ) {
+            PTDEBUG && _d($EVAL_ERROR);
+            $exit_status = 1;
+         }
+         PTDEBUG && _d('CreateUser:', Dumper(\@create_user));
+         # make this replication safe converting the CREATE USER into
+         # CREATE USER IF NOT EXISTS and then doing an ALTER USER
+            my $create = $create_user[0];
+            my $alter  = $create;
+            $create =~ s{CREATE USER}{CREATE USER IF NOT EXISTS};
+            $create =~ s{ IDENTIFIED .*}{};
+            $alter  =~ s{CREATE USER}{ALTER USER};
+            @create_user = ( $create, $alter );
+            PTDEBUG && _d('AdjustedCreateUser:', Dumper(\@create_user));
+      }
       my @grants;
       eval {
          @grants = @{ $dbh->selectcol_arrayref("SHOW GRANTS FOR $user_host") };
@@ -1902,6 +1993,9 @@ sub main {
       @grants = sort {
          $b =~ m/IDENTIFIED BY/ <=> $a =~ m/IDENTIFIED BY/ || $a cmp $b
       } @grants;
+
+      # Add @create_user if there
+      @grants = ( @create_user, @grants ) if scalar @create_user > 0;
       PTDEBUG && _d('Grants sorted:', Dumper(\@grants));
 
       # Print REVOKE statements.
@@ -1929,7 +2023,7 @@ sub main {
             }
 
             @result;
-         } @grants;
+         } grep { /\bgrant\b/i } @grants;
 
          print join(
             "\n",
@@ -1998,6 +2092,11 @@ sub split_grants {
             )
             (?:,\s)?    # Separted from the next grant, if any, by a comma
       /xg;
+      # sort columns in column-level permissions (bug lp-1523730)
+      @grants = map {
+        $_ =~ s/(INSERT|SELECT|UPDATE)\s\((.+?)\)/"$1 (" . join(', ',sort(split(', ',$2))) . ')'/me;
+        $_;
+      } @grants;
    }
    else {
       PTDEBUG && _d('Splitting grants on comma:', $grants);
@@ -2006,6 +2105,7 @@ sub split_grants {
    PTDEBUG && _d('Grants split:', Dumper(\@grants));
    return @grants;
 }
+
 
 sub _d {
    my ($package, undef, $line) = caller 0;
@@ -2397,7 +2497,7 @@ software from Percona.
 
 =head1 COPYRIGHT, LICENSE, AND WARRANTY
 
-This program is copyright 2011-2015 Percona LLC and/or its affiliates,
+This program is copyright 2011-2016 Percona LLC and/or its affiliates,
 2007-2011 Baron Schwartz.
 
 THIS PROGRAM IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS OR IMPLIED
@@ -2416,6 +2516,6 @@ Place, Suite 330, Boston, MA  02111-1307  USA.
 
 =head1 VERSION
 
-pt-show-grants 2.2.16
+pt-show-grants 2.2.19
 
 =cut

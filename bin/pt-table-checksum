@@ -57,7 +57,7 @@ BEGIN {
 {
 package Percona::Toolkit;
 
-our $VERSION = '2.2.16';
+our $VERSION = '2.2.19';
 
 use strict;
 use warnings FATAL => 'all';
@@ -1808,6 +1808,7 @@ sub new {
       'default'    => 1,
       'cumulative' => 1,
       'negatable'  => 1,
+      'repeatable' => 1,  # means it can be specified more than once
    );
 
    my $self = {
@@ -1998,6 +1999,7 @@ sub _pod_to_specs {
             desc  => $para
                . (defined $attribs{default} ? " (default $attribs{default})" : ''),
             group => ($attribs{'group'} ? $attribs{'group'} : 'default'),
+            attributes => \%attribs
          };
       }
       while ( $para = <$fh> ) {
@@ -2051,6 +2053,7 @@ sub _parse_specs {
 
          $opt->{is_negatable}  = $opt->{spec} =~ m/!/        ? 1 : 0;
          $opt->{is_cumulative} = $opt->{spec} =~ m/\+/       ? 1 : 0;
+         $opt->{is_repeatable} = $opt->{attributes}->{repeatable} ? 1 : 0;
          $opt->{is_required}   = $opt->{desc} =~ m/required/ ? 1 : 0;
 
          $opt->{group} ||= 'default';
@@ -2194,11 +2197,21 @@ sub _set_option {
          return;
       }
       else {
-         $opt->{value} = $val;
+         if ($opt->{is_repeatable}) {
+            push @{$opt->{value}} , $val;
+         }
+         else {
+            $opt->{value} = $val;
+         }
       }
    }
    else {
-      $opt->{value} = $val;
+      if ($opt->{is_repeatable}) {
+         push @{$opt->{value}} , $val;
+      }
+      else {
+         $opt->{value} = $val;
+      }
    }
    $opt->{got} = 1;
    PTDEBUG && _d('Got option', $long, '=', $val);
@@ -2218,6 +2231,12 @@ sub get_opts {
 
    $self->{errors} = [];
 
+   if ( @ARGV && $ARGV[0] =~/^--config=/ ) {
+      $ARGV[0] = substr($ARGV[0],9);
+      $ARGV[0] =~ s/^'(.*)'$/$1/;
+      $ARGV[0] =~ s/^"(.*)"$/$1/;
+      $self->_set_option('config', shift @ARGV);
+   }
    if ( @ARGV && $ARGV[0] eq "--config" ) {
       shift @ARGV;
       $self->_set_option('config', shift @ARGV);
@@ -2250,11 +2269,12 @@ sub get_opts {
    if ( exists $self->{opts}->{version} && $self->{opts}->{version}->{got} ) {
       if ( $self->{version} ) {
          print $self->{version}, "\n";
+         exit 0;
       }
       else {
          print "Error parsing version.  See the VERSION section of the tool's documentation.\n";
+         exit 1;
       }
-      exit 1;
    }
 
    if ( @ARGV && $self->{strict} ) {
@@ -2652,6 +2672,14 @@ sub _read_config_file {
          $parse  = 0;
          next LINE;
       }
+
+      if (  $parse
+            && !$self->has('version-check')
+            && $line =~ /version-check/
+      ) {
+         next LINE;
+      }
+
       if ( $parse
          && (my($opt, $arg) = $line =~ m/^\s*([^=\s]+?)(?:\s*=\s*(.*?)\s*)?$/)
       ) {
@@ -4879,7 +4907,7 @@ sub generate_del_stmt {
    my $index = $tp->find_best_index($tbl, $args{index});
    die "Cannot find an ascendable index in table" unless $index;
 
-   if ( $index ) {
+   if ( $index && $tbl->{keys}->{$index}->{is_unique}) {
       @del_cols = @{$tbl->{keys}->{$index}->{cols}};
    }
    else {
@@ -4981,23 +5009,22 @@ use warnings FATAL => 'all';
 use English qw(-no_match_vars);
 use constant PTDEBUG => $ENV{PTDEBUG} || 0;
 
-sub check_recursion_method {
+sub check_recursion_method {                                                       
    my ($methods) = @_;
-
-   if ( @$methods != 1 ) {
-      if ( grep({ !m/processlist|hosts/i } @$methods)
-            && $methods->[0] !~ /^dsn=/i )
-      {
-         die  "Invalid combination of recursion methods: "
-            . join(", ", map { defined($_) ? $_ : 'undef' } @$methods) . ". "
-            . "Only hosts and processlist may be combined.\n"
-      }
-   }
-   else {
+   if ( @$methods != 1 ) {                                                         
+      if ( grep({ !m/processlist|hosts/i } @$methods)                              
+            && $methods->[0] !~ /^dsn=/i ) 
+      {     
+         die  "Invalid combination of recursion methods: "                         
+            . join(", ", map { defined($_) ? $_ : 'undef' } @$methods) . ". "      
+            . "Only hosts and processlist may be combined.\n"                      
+      }                                                                            
+   }     
+   else {   
       my ($method) = @$methods;
-      die "Invalid recursion method: " . ( $method || 'undef' )
-         unless $method && $method =~ m/^(?:processlist$|hosts$|none$|dsn=)/i;
-   }
+      die "Invalid recursion method: " . ( $method || 'undef' )                    
+         unless $method && $method =~ m/^(?:processlist$|hosts$|none$|cluster$|dsn=)/i;     
+   }                                                                               
 }
 
 sub new {
@@ -5033,7 +5060,8 @@ sub get_slaves {
          die "I need a $arg argument" unless $args{$arg};
       }
       my ($dbh, $dsn) = @args{@required_args};
-      
+      my $o = $self->{OptionParser};
+
       $self->recurse_to_slaves(
          {  dbh       => $dbh,
             dsn       => $dsn,
@@ -5041,7 +5069,16 @@ sub get_slaves {
                my ( $dsn, $dbh, $level, $parent ) = @_;
                return unless $level;
                PTDEBUG && _d('Found slave:', $dp->as_string($dsn));
-               push @$slaves, $make_cxn->(dsn => $dsn, dbh => $dbh);
+               my $slave_dsn = $dsn;
+               if ($o->got('slave-user')) {
+                  $slave_dsn->{u} = $o->get('slave-user');
+                  PTDEBUG && _d("Using slave user ".$o->get('slave-user')." on ".$slave_dsn->{h}.":".$slave_dsn->{P});
+               }
+               if ($o->got('slave-password')) {
+                  $slave_dsn->{p} = $o->get('slave-password');
+                  PTDEBUG && _d("Slave password set");
+               }
+               push @$slaves, $make_cxn->(dsn => $slave_dsn, dbh => $dbh);
                return;
             },
          }
@@ -5239,7 +5276,7 @@ sub get_connected_slaves {
       die "You do not have the PROCESS privilege";
    }
 
-   $sql = 'SHOW PROCESSLIST';
+   $sql = 'SHOW FULL PROCESSLIST';
    PTDEBUG && _d($dbh, $sql);
    grep { $_->{command} =~ m/Binlog Dump/i }
    map  { # Lowercase the column names
@@ -5863,6 +5900,9 @@ sub get_checksum_columns {
          elsif ( $trim && $type =~ m/varchar/ ) {
             $result = "TRIM($result)";
          }
+         elsif ( $type =~ m/blob|text|binary/ ) {
+            $result = "CRC32($result)";
+         }
          $result;
       }
       grep {
@@ -6188,7 +6228,11 @@ sub new {
       PTDEBUG && _d('Ascend params:', Dumper($asc));
 
       my $from     = "$tbl->{name} FORCE INDEX(`$index`)";
-      my $order_by = join(', ', map {$q->quote($_)} @{$index_cols});
+      my $order_by = join(', ', map { $tbl->{tbl_struct}->{type_for}->{$_} eq 'enum' 
+                                        ? "CONCAT(".$q->quote($_).")" : $q->quote($_)} @{$index_cols});
+
+      my $order_by_dec = join(' DESC,', map { $tbl->{tbl_struct}->{type_for}->{$_} eq 'enum' 
+                                        ? "CONCAT(".$q->quote($_).")" : $q->quote($_)} @{$index_cols});
 
       my $first_lb_sql
          = "SELECT /*!40001 SQL_NO_CACHE */ "
@@ -6220,7 +6264,7 @@ sub new {
          . " FROM $from"
          . ($where ? " WHERE $where" : '')
          . " ORDER BY "
-         . join(' DESC, ', map {$q->quote($_)} @{$index_cols}) . ' DESC'
+         . $order_by_dec . ' DESC'
          . " LIMIT 1"
          . " /*last upper boundary*/";
       PTDEBUG && _d('Last upper boundary statement:', $last_ub_sql);
@@ -6292,6 +6336,8 @@ sub new {
    $self->{have_rows}  = 0;
    $self->{rowno}      = 0;
    $self->{oktonibble} = 1;
+   $self->{pause_file} = $nibble_params->{pause_file};
+   $self->{sleep}      = $args{sleep} || 60;
 
    return bless $self, $class;
 }
@@ -6330,6 +6376,24 @@ sub next {
 
    NIBBLE:
    while ( $self->{have_rows} || $self->_next_boundaries() ) {
+
+      if ($self->{pause_file}) {
+         while(-f $self->{pause_file}) {
+            print "Sleeping $self->{sleep} seconds because $self->{pause_file} exists\n";
+            my $dbh = $self->{Cxn}->dbh();
+            if ( !$dbh || !$dbh->ping() ) {
+               eval { $dbh = $self->{Cxn}->connect() }; # connect or die trying
+               if ( $EVAL_ERROR ) {
+                  chomp $EVAL_ERROR;
+                  die "Lost connection to " . $self->{Cxn}->name() . " while waiting for "
+                  . "replica lag ($EVAL_ERROR)\n";
+               }
+            }
+            $dbh->do("SELECT 'nibble iterator keepalive'");
+            sleep($self->{sleep});
+         }
+      }
+  
       if ( !$self->{have_rows} ) {
          $self->{nibbleno}++;
          PTDEBUG && _d('Nibble:', $self->{nibble_sth}->{Statement}, 'params:',
@@ -6359,6 +6423,7 @@ sub next {
       }
       $self->{rowno}     = 0;
       $self->{have_rows} = 0;
+      
    }
 
    PTDEBUG && _d('Done nibbling');
@@ -6494,10 +6559,13 @@ sub can_nibble {
       die "There is no good index and the table is oversized.";
    }
 
+   my $pause_file = ($o->has('pause-file') && $o->get('pause-file')) || undef;
+   
    return {
       row_est     => $row_est,      # nibble about this many rows
       index       => $index,        # using this index
       one_nibble  => $one_nibble,   # if the table fits in one nibble/chunk
+      pause_file  => $pause_file,
    };
 }
 
@@ -6508,23 +6576,26 @@ sub _find_best_index {
    my $tbl_struct = $tbl->{tbl_struct};
    my $indexes    = $tbl_struct->{keys};
 
+   my $best_index;
    my $want_index = $args{chunk_index};
    if ( $want_index ) {
       PTDEBUG && _d('User wants to use index', $want_index);
       if ( !exists $indexes->{$want_index} ) {
          PTDEBUG && _d('Cannot use user index because it does not exist');
          $want_index = undef;
+      } else {
+         $best_index = $want_index;
       }
    }
 
-   if ( !$want_index && $args{mysql_index} ) {
+   if ( !$best_index && !$want_index && $args{mysql_index} ) {
       PTDEBUG && _d('MySQL wants to use index', $args{mysql_index});
       $want_index = $args{mysql_index};
    }
 
-   my $best_index;
+
    my @possible_indexes;
-   if ( $want_index ) {
+   if ( !$best_index && $want_index ) {
       if ( $indexes->{$want_index}->{is_unique} ) {
          PTDEBUG && _d('Will use wanted index');
          $best_index = $want_index;
@@ -6534,7 +6605,8 @@ sub _find_best_index {
          push @possible_indexes, $want_index;
       }
    }
-   else {
+   
+   if (!$best_index) {
       PTDEBUG && _d('Auto-selecting best index');
       foreach my $index ( $tp->sort_indexes($tbl_struct) ) {
          if ( $index eq 'PRIMARY' || $indexes->{$index}->{is_unique} ) {
@@ -7542,7 +7614,7 @@ sub database_is_allowed {
 
    my $filter = $self->{filters};
 
-   if ( $db =~ m/information_schema|performance_schema|lost\+found/ ) {
+   if ( $db =~ m/information_schema|performance_schema|lost\+found|percona|percona_schema|test/ ) {
       PTDEBUG && _d('Database', $db, 'is a system database, ignoring');
       return 0;
    }
@@ -7585,14 +7657,21 @@ sub table_is_allowed {
 
    return 0 if $db eq 'mysql' && $tbl =~ m/^(?:
        general_log
-      |slow_log
+      |gtid_execution
       |innodb_index_stats
       |innodb_table_stats
+      |inventory
+      |plugin
+      |proc
       |slave_master_info
       |slave_relay_log_info
       |slave_worker_info
+      |slow_log    
    )$/x;
 
+   return 0 if $db eq 'sys' && $tbl =~ m/^(?:
+       sys_config
+   )$/x;
    if ( $filter->{'ignore-tables'}->{'*'}->{$tbl} 
          || $filter->{'ignore-tables'}->{$db}->{$tbl}) {
       PTDEBUG && _d('Table', $tbl, 'is in --ignore-tables list');
@@ -9990,8 +10069,9 @@ sub main {
                            . $slave->name() . ": $e";
                      }
                      PTDEBUG && _d('Table on', $slave->name(), 'has', $n_rows, 'rows');
+                     my $slave_skip_tolerance = $o->get('slave-skip-tolerance') || 1;
                      if ( $n_rows
-                          && $n_rows > ($tbl->{chunk_size} * $chunk_size_limit) )
+                          && $n_rows > ($tbl->{chunk_size} * $chunk_size_limit) * $slave_skip_tolerance )
                      {
                         PTDEBUG && _d('Table too large on', $slave->name());
                         push @too_large, [$slave->name(), $n_rows || 0];
@@ -12348,6 +12428,12 @@ short form: -p; type: string; group: Connection
 Password to use when connecting.
 If password contains commas they must be escaped with a backslash: "exam\,ple"
 
+=item --pause-file
+
+type: string 
+
+Execution will be paused while the file specified by this param exists.
+
 =item --pid
 
 type: string
@@ -12494,7 +12580,7 @@ structure (MAGIC_create_replicate):
      ts             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
      PRIMARY KEY (db, tbl, chunk),
      INDEX ts_db_tbl (ts, db, tbl)
-  ) ENGINE=InnoDB;
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 Note: lower_boundary and upper_boundary data type can be BLOB. See L<"--binary-index">.
 
@@ -12585,6 +12671,22 @@ type: string; default: #
 The separator character used for CONCAT_WS().  This character is used to join
 the values of columns when checksumming.
 
+=item --slave-user
+
+type: string
+
+Sets the user to be used to connect to the slaves.
+This parameter allows you to have a different user with less privileges on the
+slaves but that user must exist on all slaves.
+
+=item --slave-password
+
+type: string
+
+Sets the password to be used to connect to the slaves.
+It can be used with --slave-user and the password for the user must be the same
+on all slaves.
+
 =item --set-vars
 
 type: Array; group: Connection
@@ -12609,6 +12711,17 @@ The tool prints a warning and continues if a variable cannot be set.
 short form: -S; type: string; group: Connection
 
 Socket file to use for connection.
+
+=item --slave-skip-tolerance
+
+type: float; default: 1.0 
+
+When a master table is marked to be checksumed in only one chunk but a slave
+table exceeds the maximum accepted size for this, the table is skipped. 
+Since number of rows are often rough estimates, many times tables are skipped
+needlessly for very small differences.
+This option provides a max row excess tolerance to prevent this.
+For example a value of 1.2 will tolerate slave tables with up to 20% excess rows.
 
 =item --tables
 
@@ -12921,7 +13034,7 @@ software from Percona.
 
 =head1 COPYRIGHT, LICENSE, AND WARRANTY
 
-This program is copyright 2011-2015 Percona LLC and/or its affiliates,
+This program is copyright 2011-2016 Percona LLC and/or its affiliates,
 2007-2011 Baron Schwartz.
 
 THIS PROGRAM IS PROVIDED "AS IS" AND WITHOUT ANY EXPRESS OR IMPLIED
@@ -12940,6 +13053,6 @@ Place, Suite 330, Boston, MA  02111-1307  USA.
 
 =head1 VERSION
 
-pt-table-checksum 2.2.16
+pt-table-checksum 2.2.19
 
 =cut
