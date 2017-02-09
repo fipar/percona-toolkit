@@ -1929,6 +1929,7 @@ for details.
 =item --mongo
 
 Connect to a MongoDB/TokuMX instance instead of a MySQL one. Disables all the MySQL-related captures.
+
 =item --notify-by-email
 
 type: string
