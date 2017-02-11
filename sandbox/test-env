@@ -6,6 +6,9 @@
 # vars like PERCONA_TOOLKIT_BRANCH and PERCONA_TOOLKIT_SANDBOX are correct.
 # Exist 0 on success/no errors, or 1 on any warnings or errors.
 
+# This file adds functions to control mongo sandboxes.
+. mongo_sandbox.sh
+
 err() {
    for msg; do
       echo "$msg" >&2
@@ -44,6 +47,108 @@ usage() {
        "  reset       Reset test server binary logs"               \
        "  version     Print MySQL version of running test servers" \
        "" 
+}
+
+start_single_mongod() {
+    init_dbpath $PWD/mongod_single
+    start_mongod $PWD/mongod_single 27017
+}
+
+stop_single_mongod() {
+    stop_mongo ./mongod_single
+}
+
+start_rs_mongod() {
+    local port_prefix=2700
+
+    msg "Starting 4 mongod instances"
+
+    for i in 1 2 3 4; do
+	init_dbpath $PWD/mongod_rsTest_$i
+	start_mongod $PWD/mongod_rsTest_$i $port_prefix$i rsTest
+    done
+
+    msg "Sleeping two seconds and initializing set"
+    sleep 2
+    mongo --port ${port_prefix}1 --eval "rs.initiate()"
+
+    msg "Waiting for set to initiate"
+    while [ $(mongo --port ${port_prefix}1 --eval "printjson(rs.status())"|grep -c PRIMARY) -eq 0 ]; do sleep 1; done
+
+    msg "Adding secondaries"
+    h=$(hostname)
+    mongo --port ${port_prefix}1 --eval "for (i=2; i<=4; i++) {rs.add(\"${h}:2700\"+i)}"
+
+    msg "Waiting one second before attempting to print status"
+    sleep 1
+    mongo --port ${port_prefix}1 --eval "printjson(rs.status())"
+}
+
+stop_rs_mongod() {
+    local port_prefix=2700
+
+    for i in 1 2 3 4; do
+	stop_mongo $PWD/mongod_rsTest_$i
+    done
+}
+
+start_sharded_mongod() {
+    port_prefix=2800
+    shard_port_prefix=3000
+    mongos_port=29000
+    h=$(hostname)
+
+
+    msg "starting config servers"
+    configdb=""
+    for i in 1 2 3; do
+	init_dbpath $PWD/mongod_config_$i
+	start_mongod $PWD/mongod_config_$i $port_prefix$i configsvr
+	configdb="$h:${port_prefix}$i,${configdb}"
+    done
+
+    configdb=$(echo $configdb|sed 's/,$//g')
+
+    msg "starting mongos"
+    init_dbpath $PWD/mongos
+    start_mongos $PWD/mongos $mongos_port $configdb
+
+    msg "sleeping one second"
+    sleep 1
+
+    msg "starting and adding shards"
+    for i in 1 2 3; do
+	init_dbpath $PWD/mongod_shard_$i
+	start_mongod $PWD/mongod_shard_$i $shard_port_prefix$i
+	    sleep 0.3
+	    mongo --host $h --port $shard_port_prefix$i --eval 'rs.initiate()'
+	    sleep 0.3
+	    mongo --host $h --port $mongos_port --eval "sh.addShard(\"shard$i/$h:$shard_port_prefix$i\")"
+    done
+
+    msg "sleeping one second before attempting to print status"
+    sleep 1
+    mongo --port $mongos_port --eval "printjson(sh.status())"
+}
+
+stop_sharded_mongod() {
+    port_prefix=2800
+    shard_port_prefix=3000
+    mongos_port=29000
+
+    msg "stopping config servers"
+    configdb=""
+    for i in 1 2 3; do
+	stop_mongo $PWD/mongod_config_$i
+    done
+
+    msg "stopping mongos"
+    stop_mongo $PWD/mongos
+
+    msg "stopping shards"
+    for i in 1 2 3; do
+	stop_mongo $PWD/mongod_shard_$i
+    done
 }
 
 mysql_basedir_ok() {
@@ -288,6 +393,7 @@ fi
 
 case $opt in
    start)
+      start_single_mongod
       cd $PERCONA_TOOLKIT_BRANCH/sandbox
       ./start-sandbox "${2:-"master"}" 12345
       exit_status=$((exit_status | $?))
@@ -361,6 +467,7 @@ case $opt in
       fi
       ;;
    stop)
+      stop_single_mongod
       cd $PERCONA_TOOLKIT_BRANCH/sandbox
       ./stop-sandbox 12349 12348 12347 12346 12345 
       exit_status=$((exit_status | $?))
