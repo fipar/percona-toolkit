@@ -1,10 +1,16 @@
 Changelog for Percona Toolkit
 
-v2.2.20 
+v2.2.21
+
+ * Fixed bug 1402776: Improved fix (protocol parser fix): error when parsing tcpdump capture with pt-query-digest
+ * Fixed bug 1632522: pt-osc: Fails with duplicate key in table for self-referencing (Thanks Amiel Marqeta)
+ * Fixed bug 1654668: pt-summary exists with an error (Thanks Marcelo Altmann)
+
+v2.2.20  released 2016-12-09
 
  * Fixed bug 1362942: pt-slave-restart fails on MariaDB 10.0.13 (gtid_mode confusion)
  * Fixed bug 1566556: pt-show-grants fails against MariaDB10+	
- * Fature    1604834: pt-query-digest numbers in table or column names converted to question marks (--preserve-embedded-numbers)
+ * Feature   1604834: pt-query-digest numbers in table or column names converted to question marks (--preserve-embedded-numbers)
  * Fixed bug 1613915: pt-online-schema-change misses data.  Fixed sort order for ENUM fields 
  * Fixed bug 1625005: pt-online-schema-change doesn't apply underscores to foreign keys individually
  * Fixed bug 1634900: pt-upgrade fails with SELECT INTO 
